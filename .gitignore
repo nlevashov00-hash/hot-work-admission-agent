@@ -27,3 +27,7 @@ secrets.*
 *.swp
 Thumbs.db
 Desktop.ini
+
+# Generated evaluation output and audit
+/eval/run_results.json
+/eval/journal/
