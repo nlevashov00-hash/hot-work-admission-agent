@@ -1,4 +1,3 @@
-import copy
 import unittest
 
 from app.contracts import FACT_TYPES

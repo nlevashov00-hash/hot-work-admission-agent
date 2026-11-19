@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from app.contracts import ContractError, parse_facts, validate_result
+from app.contracts import parse_facts, validate_result
 from app.prompt import PROMPT_VERSION, SYSTEM_PROMPT
 
 MAX_TEXT_CHARS = 12000
