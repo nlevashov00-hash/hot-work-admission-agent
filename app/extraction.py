@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import math
+import random
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import os
 import socket
 import ssl
@@ -12,12 +16,13 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from app.contracts import parse_facts, validate_result
+from app.contracts import parse_facts, validate_facts, validate_result
 from app.prompt import PROMPT_VERSION, SYSTEM_PROMPT
 
 MAX_TEXT_CHARS = 12000
 TIMEOUT_SECONDS = 30
 MAX_ATTEMPTS = 2
+MAX_RETRY_WAIT_SECONDS = 30.0
 MAX_RESPONSE_BYTES = 1_000_000
 USER_AGENT = "HotWorkAdmissionAgent/1.0"
 
@@ -105,11 +110,49 @@ class Extraction:
             "missing": ["Достоверные сведения заявки"]})
 
 
+def _retry_delay(exc: urllib.error.HTTPError, attempt: int) -> float:
+    value = exc.headers.get('Retry-After') if exc.headers else None
+    if value:
+        try:
+            seconds = float(value)
+            if math.isfinite(seconds) and seconds >= 0:
+                return seconds
+        except ValueError:
+            try:
+                when = parsedate_to_datetime(value)
+                if when.tzinfo is not None:
+                    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+            except (ValueError, TypeError, OverflowError):
+                pass
+    return (2 ** (attempt - 1)) + random.uniform(0, 1)
+
+
+def _derive_proximity(facts: dict[str, Any]) -> dict[str, Any]:
+    """Derive only missing proximity from a validated, unambiguous distance."""
+    import copy
+    normalized = copy.deepcopy(facts)
+    for prefix in ("coal", "fuel"):
+        near = normalized[f"{prefix}_store_near"]
+        distance = normalized[f"{prefix}_store_distance_m"]
+        if near["state"] != "unknown" or distance["state"] != "known":
+            continue
+        interval = distance["value"]
+        if interval["max"] < 10:
+            value = True
+        elif interval["min"] >= 10:
+            value = False
+        else:
+            continue
+        near.update(state="known", value=value, evidence=distance["evidence"].copy())
+    return validate_facts(normalized)
+
+
 def extract(text: str, client: Client) -> Extraction:
     start = time.monotonic()
     attempts: list[dict[str, Any]] = []
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT_CHARS:
         return Extraction(None, attempts, time.monotonic() - start, error="invalid_text")
+    waited = 0.0
     for attempt in range(1, MAX_ATTEMPTS + 1):
         began = time.monotonic()
         try:
@@ -130,6 +173,7 @@ def extract(text: str, client: Client) -> Extraction:
             facts = parse_facts(response.content)
             if any(fragment not in text for fact in facts.values() for fragment in fact["evidence"]):
                 raise ValueError("Evidence is not in application")
+            facts = _derive_proximity(facts)
             record["elapsed_seconds"] = time.monotonic() - began
             return Extraction(facts, attempts, time.monotonic() - start)
         except Exception as exc:
@@ -161,4 +205,12 @@ def extract(text: str, client: Client) -> Extraction:
             attempts[-1]["elapsed_seconds"] = time.monotonic() - began
             if status in (401, 403):
                 break
+            if status == 429 and attempt < MAX_ATTEMPTS:
+                delay = _retry_delay(exc, attempt)
+                if waited + delay > MAX_RETRY_WAIT_SECONDS:
+                    attempts[-1].update({"retry_reason": "rate_limit_wait_exceeded", "wait_seconds": 0.0})
+                    break
+                attempts[-1].update({"retry_reason": "rate_limit", "wait_seconds": delay})
+                time.sleep(delay)
+                waited += delay
     return Extraction(None, attempts, time.monotonic() - start, error="extraction_failed")

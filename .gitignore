@@ -31,3 +31,9 @@ Desktop.ini
 # Generated evaluation output and audit
 /eval/run_results.json
 /eval/journal/
+
+/eval/baseline/
+
+/eval/repeat/
+
+/eval/final/

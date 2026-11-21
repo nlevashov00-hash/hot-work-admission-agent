@@ -2,11 +2,12 @@ import json
 import unittest
 import urllib.error
 import socket
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from app.contracts import FACT_TYPES
 from app.extraction import (Config, MAX_ATTEMPTS, MAX_TEXT_CHARS, OpenAIClient,
-                            Response, extract, _NoRedirect)
+                            Response, extract, _NoRedirect, _retry_delay, _derive_proximity)
 from app.prompt import SYSTEM_PROMPT
 
 
@@ -48,7 +49,8 @@ class ExtractionTests(unittest.TestCase):
             self.assertEqual(outcome.failure_result(1)['decision'], 'ЭСКАЛИРОВАТЬ')
             self.assertNotIn('secret', str(outcome))
 
-    def test_safe_diagnostics(self):
+    @patch('app.extraction.time.sleep')
+    def test_safe_diagnostics(self, sleep):
         for code in (401, 403, 429, 500, 503):
             err = urllib.error.HTTPError('https://example.test/secret', code, 'private-key', {}, None)
             outcome = extract('заявка', Fake([err] * MAX_ATTEMPTS))
@@ -67,6 +69,38 @@ class ExtractionTests(unittest.TestCase):
             self.assertNotIn('secret', str(outcome))
             self.assertEqual(outcome.failure_result(1)['decision'], 'ЭСКАЛИРОВАТЬ')
 
+    @patch('app.extraction.time.sleep')
+    def test_rate_limit_retry_after_and_exhaustion(self, sleep):
+        for header, expected in [('16.9125', 16.9125), (None, 1.5)]:
+            headers = {'Retry-After': header} if header else {}
+            err = urllib.error.HTTPError('https://example.test', 429, 'secret', headers, None)
+            with self.subTest(header=header), patch('app.extraction.random.uniform', return_value=0.5):
+                sleep.reset_mock()
+                outcome = extract('заявка', Fake([err, err]))
+                self.assertEqual(len(outcome.attempts), 2)
+                sleep.assert_called_once_with(expected)
+                self.assertEqual(outcome.attempts[0]['retry_reason'], 'rate_limit')
+                self.assertEqual(outcome.attempts[0]['wait_seconds'], expected)
+                self.assertEqual(outcome.failure_result(1)['decision'], 'ЭСКАЛИРОВАТЬ')
+        sleep.reset_mock()
+        err = urllib.error.HTTPError('https://example.test', 429, 'secret', {'Retry-After': '31'}, None)
+        outcome = extract('заявка', Fake([err]))
+        sleep.assert_not_called()
+        self.assertEqual(len(outcome.attempts), 1)
+        self.assertEqual(outcome.attempts[0]['retry_reason'], 'rate_limit_wait_exceeded')
+
+    def test_retry_after_http_dates_and_invalid(self):
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        for header, expected in [('Thu, 01 Jan 2026 00:00:20 GMT', 20),
+                                 ('Wed, 31 Dec 2025 23:59:59 GMT', 0),
+                                 ('invalid', 1.25)]:
+            error = urllib.error.HTTPError('https://example.test', 429, '', {'Retry-After': header}, None)
+            with self.subTest(header=header), patch('app.extraction.datetime', FixedDateTime), patch('app.extraction.random.uniform', return_value=0.25):
+                self.assertEqual(_retry_delay(error, 1), expected)
+
     def test_invalid_text_never_calls(self):
         for text in ('', '  ', 'x' * (MAX_TEXT_CHARS + 1)):
             client = Fake([])
@@ -82,6 +116,39 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(result.facts['permit_present']['state'], 'contradictory')
         result = extract('другой текст', Fake([Response(json.dumps(data))] * MAX_ATTEMPTS))
         self.assertIsNone(result.facts)
+
+    def test_proximity_derivation_boundaries_and_conflicts(self):
+        for prefix in ('coal', 'fuel'):
+            for lo, hi, expected in [(9.9, 9.9, True), (10, 10, False), (10.1, 10.1, False), (9, 10, None)]:
+                facts = json.loads(payload())
+                name = prefix + '_store_distance_m'
+                facts[name] = {'state': 'known', 'value': {'min': lo, 'max': hi, 'approximate': lo != hi}, 'evidence': ['фрагмент']}
+                result = _derive_proximity(facts)
+                near = result[prefix + '_store_near']
+                with self.subTest(prefix=prefix, lo=lo, hi=hi):
+                    self.assertEqual(near['value'], expected)
+                    self.assertEqual(near['state'], 'unknown' if expected is None else 'known')
+                    if expected is not None:
+                        self.assertEqual(near['evidence'], ['фрагмент'])
+                    self.assertEqual(facts[prefix + '_store_near']['state'], 'unknown')
+        facts = json.loads(payload())
+        facts['coal_store_near'] = {'state': 'contradictory', 'value': None, 'evidence': ['а', 'б']}
+        facts['coal_store_distance_m'] = {'state': 'known', 'value': {'min': 11, 'max': 11, 'approximate': False}, 'evidence': ['11']}
+        self.assertEqual(_derive_proximity(facts)['coal_store_near']['state'], 'contradictory')
+
+    def test_derived_proximity_in_extraction(self):
+        data = json.loads(payload())
+        data['coal_store_distance_m'] = {'state': 'known', 'value': {'min': 10, 'max': 10, 'approximate': False}, 'evidence': ['10 м']}
+        outcome = extract('расстояние 10 м', Fake([Response(json.dumps(data, ensure_ascii=False))]))
+        self.assertEqual(outcome.facts['coal_store_near']['value'], False)
+        self.assertEqual(outcome.facts['coal_store_near']['evidence'], ['10 м'])
+
+    def test_prompt_extraction_instructions_are_versioned(self):
+        from app.prompt import PROMPT_VERSION
+        self.assertEqual(PROMPT_VERSION, 'p06-v2')
+        for phrase in ('устное согласование само по себе', 'менее 10 м', 'не выполняет работу',
+                       'на уровне пола или земли', 'наряда нет или его только оформят'):
+            self.assertIn(phrase, SYSTEM_PROMPT)
 
     def test_url_security(self):
         for url in ('https://example.test/v1', 'http://localhost:8000/v1',

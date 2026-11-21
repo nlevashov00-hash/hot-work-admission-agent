@@ -9,6 +9,8 @@ use the actual returned decision; reference-rule comparisons are counted separat
 import argparse
 import json
 import re
+import math
+import time
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -75,9 +77,32 @@ def evaluate_cases(cases: list[dict[str, Any]], results: Any, errors: list[str |
     return {'metrics': metrics, 'details': details}
 
 
-def run_eval(cases: list[dict[str, Any]], client: Any, model: str, journal: Path, output: Path, secret: str = '') -> dict[str, Any]:
+class _ThrottledClient:
+    """Limit the start times of every request, including extraction retries."""
+    def __init__(self, client: Any, interval: float):
+        self.client = client
+        self.interval = interval
+        self.last_start: float | None = None
+        self.config = getattr(client, 'config', None)
+
+    def complete(self, text: str) -> Any:
+        if self.last_start is not None:
+            remaining = self.interval - (time.monotonic() - self.last_start)
+            if remaining > 0:
+                time.sleep(remaining)
+        self.last_start = time.monotonic()
+        return self.client.complete(text)
+
+
+def run_eval(cases: list[dict[str, Any]], client: Any, model: str, journal: Path, output: Path, secret: str = '', interval_seconds: float = 0.0) -> dict[str, Any]:
+    if not math.isfinite(interval_seconds) or interval_seconds < 0:
+        raise ValueError('Invalid interval')
+    batch = [{'id': c['id'], 'text': c['text']} for c in cases]
+    validate_batch(batch)
     run_journal = journal / uuid.uuid4().hex
-    results = process_batch([{'id': c['id'], 'text': c['text']} for c in cases], client, model, run_journal, secret)
+    throttled = _ThrottledClient(client, interval_seconds)
+    results = process_batch(batch, throttled, model, run_journal, secret)
+    validate_results(batch, results)
     records = [json.loads(path.read_text(encoding='utf-8')) for path in run_journal.glob('*.json')]
     by_id = {(type(r['input']['id']), r['input']['id']): r for r in records}
     if len(records) != len(cases) or len(by_id) != len(cases):
@@ -99,11 +124,12 @@ def main() -> int:
     parser.add_argument('--dataset', type=Path, default=Path('eval/dataset.json'))
     parser.add_argument('--output', type=Path, default=Path('eval/run_results.json'))
     parser.add_argument('--journal', type=Path, default=Path('eval/journal'))
+    parser.add_argument('--interval-seconds', type=float, default=0.0)
     args = parser.parse_args()
     try:
         cases = load_dataset(args.dataset)
         config = Config.from_env()
-        report = run_eval(cases, OpenAIClient(config), config.model, args.journal, args.output, config.api_key)
+        report = run_eval(cases, OpenAIClient(config), config.model, args.journal, args.output, config.api_key, args.interval_seconds)
     except Exception:
         print('Ошибка загрузки, обработки или сохранения eval.')
         return 1

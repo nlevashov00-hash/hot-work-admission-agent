@@ -3,7 +3,9 @@ import json
 import tempfile
 import subprocess
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 from app.contracts import FACT_TYPES
 from app.extraction import Response
@@ -106,6 +108,29 @@ class EvalTests(unittest.TestCase):
             self.assertFalse(report['details'][0]['match'])
             self.assertIsNone(report['details'][1]['technical_error'])
             self.assertEqual(report['metrics']['official']['technical_failures'], 1)
+
+    def test_runner_throttles_every_attempt(self):
+        cases = load_dataset(Path('eval/dataset.json'))[:2]
+        class Clock:
+            now = 0.0
+            def monotonic(self): return self.now
+            def sleep(self, seconds): self.now += seconds
+        class RetryClient:
+            def __init__(self, clock, error): self.clock, self.error, self.starts = clock, error, []
+            def complete(self, text):
+                self.starts.append(self.clock.now)
+                if len(self.starts) == 1: raise self.error
+                return Fake().complete(text)
+        for error in (urllib.error.HTTPError('https://example.test', 429, '', {'Retry-After': '0'}, None), TimeoutError()):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                clock = Clock(); client = RetryClient(clock, error); root = Path(directory)
+                with patch('time.monotonic', side_effect=clock.monotonic), patch('time.sleep', side_effect=clock.sleep):
+                    run_eval(cases, client, 'stub', root / 'journal', root / 'out.json', interval_seconds=20)
+                self.assertEqual(client.starts, [0, 20, 40])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(ValueError):
+                run_eval(cases, Fake(), 'stub', root / 'journal', root / 'out.json', interval_seconds=-1)
 
     def test_runner_saves_details(self):
         cases = load_dataset(Path('eval/dataset.json'))
